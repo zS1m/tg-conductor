@@ -64,6 +64,24 @@ curl -s     http://127.0.0.1:8765/healthz          # health
 curl -N     http://127.0.0.1:8765/runs/<id>/stream # live run events
 ```
 
+### Run with Docker
+
+A prebuilt multi-arch (amd64/arm64) image is published to GHCR:
+
+```sh
+docker run -d --name tg-conductor \
+  -e APP_MASTER_KEY="$(python3 -c 'import secrets,base64;print(base64.b64encode(secrets.token_bytes(32)).decode())')" \
+  -e SCHEDULER_TZ=Asia/Shanghai \
+  -v "$PWD/data:/app/data" -v "$PWD/workflows:/app/workflows:ro" \
+  -p 127.0.0.1:8765:8765 \
+  ghcr.io/zs1m/tg-conductor:latest
+
+docker exec -it tg-conductor tg-conductor account login --owner 1 --label main
+docker restart tg-conductor   # connect the account (it connects at startup)
+```
+
+Or use [`docker-compose.example.yml`](docker-compose.example.yml).
+
 ## Configuration
 
 Set via environment / `.env`. Only `APP_MASTER_KEY` is required.

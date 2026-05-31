@@ -63,6 +63,24 @@ curl -s     http://127.0.0.1:8765/healthz          # 健康检查
 curl -N     http://127.0.0.1:8765/runs/<id>/stream # 实时运行事件
 ```
 
+### 用 Docker 运行
+
+GHCR 上有预构建的多架构(amd64/arm64)镜像:
+
+```sh
+docker run -d --name tg-conductor \
+  -e APP_MASTER_KEY="$(python3 -c 'import secrets,base64;print(base64.b64encode(secrets.token_bytes(32)).decode())')" \
+  -e SCHEDULER_TZ=Asia/Shanghai \
+  -v "$PWD/data:/app/data" -v "$PWD/workflows:/app/workflows:ro" \
+  -p 127.0.0.1:8765:8765 \
+  ghcr.io/zs1m/tg-conductor:latest
+
+docker exec -it tg-conductor tg-conductor account login --owner 1 --label main
+docker restart tg-conductor   # 让服务连接账号(账号在启动时连接)
+```
+
+或使用 [`docker-compose.example.yml`](docker-compose.example.yml)。
+
 ## 配置
 
 通过环境变量 / `.env` 设置，仅 `APP_MASTER_KEY` 必填。

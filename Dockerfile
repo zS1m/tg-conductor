@@ -89,6 +89,10 @@ USER app
 
 EXPOSE 8765
 
+# Liveness: /healthz always returns 200 once the HTTP listener is up.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request as u,sys; sys.exit(0 if u.urlopen('http://127.0.0.1:8765/healthz',timeout=4).getcode()==200 else 1)"
+
 # Run migrations then start the service. The lifespan inside
 # ``tg-conductor serve`` also calls ``upgrade_head``; running it here
 # is belt-and-suspenders so a misconfigured runtime fails fast before

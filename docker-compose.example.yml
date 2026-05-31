@@ -24,6 +24,8 @@
 
 services:
   tg-conductor:
+    # Build locally (below), OR use the prebuilt multi-arch image: delete the
+    # `build:` block and set `image: ghcr.io/zs1m/tg-conductor:latest`.
     build:
       context: .
       dockerfile: Dockerfile
