@@ -73,7 +73,7 @@ Set via environment / `.env`. Only `APP_MASTER_KEY` is required.
 | `APP_MASTER_KEY` | — (required) | base64 32 bytes; encrypts session strings |
 | `OPENAI_API_KEY` | unset | only for AI actions |
 | `BIND_HOST` / `BIND_PORT` | `127.0.0.1` / `8765` | HTTP bind (`0.0.0.0` in Docker) |
-| `SCHEDULER_TZ` | `UTC` | timezone for cron / time_window |
+| `SCHEDULER_TZ` | `UTC` | cron / time_window timezone — **set to your zone (e.g. `Asia/Shanghai`) or schedules run in UTC** |
 | `WORKFLOW_DIR` | `workflows` | workflow YAML location |
 
 All options are documented in [`.env.example`](.env.example).

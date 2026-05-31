@@ -303,6 +303,21 @@ async def _startup(settings: Settings) -> LifespanState:
                 session, owner_id=settings.default_owner_id
             )
         )
+    if accounts_total == 0:
+        # Common first-run footgun, esp. in containers where the service
+        # starts before ``account login`` is run: workflows referencing an
+        # account fail validation and silently never load. Make the remedy
+        # loud and actionable.
+        log.warning(
+            "lifespan.no_accounts",
+            hint=(
+                "No Telegram account is connected. Run "
+                "`tg-conductor account login --owner <id>` then restart the "
+                "service — workflows referencing an account stay inactive "
+                "until an account exists at startup."
+            ),
+        )
+
     log_startup_summary(
         settings=settings,
         version=__version__,

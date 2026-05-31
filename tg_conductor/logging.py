@@ -176,6 +176,7 @@ def log_startup_summary(
         tg_min_interval_seconds=settings.tg_min_interval_seconds,
         job_default_timeout_seconds=settings.job_default_timeout_seconds,
         run_events_ttl_days=settings.run_events_ttl_days,
+        scheduler_tz=settings.scheduler_tz,
         accounts_total=accounts_total,
         workflows_total=workflows_total,
         cors_origins=list(settings.cors_origins),

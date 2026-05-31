@@ -8,6 +8,10 @@
 #   4. docker compose -f docker-compose.example.yml up -d --build
 #   5. docker compose -f docker-compose.example.yml exec tg-conductor \
 #        tg-conductor account login --owner 1 --label main
+#   6. Restart so the service connects the new account — it connects
+#      accounts at startup, so one added while it's running is only picked
+#      up on restart (until then, workflows referencing it stay inactive):
+#        docker compose -f docker-compose.example.yml restart
 #
 # The interactive ``account login`` flow needs a TTY — that's why we
 # expose ``tty: true`` + ``stdin_open: true`` and run the login via
@@ -45,6 +49,10 @@ services:
       # easy override per deployment.
       BIND_HOST: "0.0.0.0"
       BIND_PORT: "8765"
+      # cron / time_window are interpreted in this zone. Default UTC — set
+      # to your zone or schedules fire at the wrong wall-clock time. (Changing
+      # this needs `up -d` to recreate the container, not `restart`.)
+      SCHEDULER_TZ: "UTC"
       DATABASE_URL: "sqlite+aiosqlite:///data/tg-conductor.sqlite3"
       WORKFLOW_DIR: "/app/workflows"
       DEFAULT_OWNER_ID: "1"

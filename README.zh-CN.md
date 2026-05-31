@@ -72,7 +72,7 @@ curl -N     http://127.0.0.1:8765/runs/<id>/stream # 实时运行事件
 | `APP_MASTER_KEY` | —（必填） | base64 的 32 字节；加密 session 字符串 |
 | `OPENAI_API_KEY` | 未设 | 仅 AI 动作需要 |
 | `BIND_HOST` / `BIND_PORT` | `127.0.0.1` / `8765` | HTTP 绑定（Docker 用 `0.0.0.0`） |
-| `SCHEDULER_TZ` | `UTC` | cron / time_window 的时区 |
+| `SCHEDULER_TZ` | `UTC` | cron / time_window 时区 —— **设成你的时区(如 `Asia/Shanghai`),否则按 UTC 触发** |
 | `WORKFLOW_DIR` | `workflows` | workflow YAML 目录 |
 
 全部选项见 [`.env.example`](.env.example)。
