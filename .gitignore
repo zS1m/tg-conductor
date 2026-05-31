@@ -1,0 +1,81 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# 类型检查
+.mypy_cache/
+.pyre/
+.pytype/
+
+# Ruff
+.ruff_cache/
+
+# 编辑器 / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.cursor/
+
+# macOS / Linux 系统文件
+.DS_Store
+Thumbs.db
+
+# 项目敏感数据 —— 永远不要提交
+.env
+.env.*
+!.env.example
+*.session
+*.session_string
+*.session-journal
+
+# AI 模型定价：example 提交，部署方真实定价不进仓库
+pricing.yaml
+!pricing.yaml.example
+
+# 本地运行数据
+data/
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+logs/
+*.log
+
+# 运行期 workflow 配置（用户私有，含真实 chat_id）；示例见 docs/workflow_examples.md
+# 根锚定：只忽略仓库根的 workflows/，不波及 openspec/.../workflows/ 等同名目录
+/workflows/
+
+# Alembic 本地 SQLite 文件 (迁移代码本身要提交)
+alembic_migrations/versions/__pycache__/
+
+# Docker 本地状态
+docker-compose.override.yml

@@ -1,0 +1,63 @@
+# tg-conductor docker compose example.
+#
+# Quick start:
+#
+#   1. cp .env.example .env  (and fill in APP_MASTER_KEY + OPENAI_API_KEY)
+#   2. cp pricing.yaml.example pricing.yaml  (edit prices if needed)
+#   3. mkdir -p workflows data && put your *.yaml workflows under ./workflows
+#   4. docker compose -f docker-compose.example.yml up -d --build
+#   5. docker compose -f docker-compose.example.yml exec tg-conductor \
+#        tg-conductor account login --owner 1 --label main
+#
+# The interactive ``account login`` flow needs a TTY — that's why we
+# expose ``tty: true`` + ``stdin_open: true`` and run the login via
+# ``docker compose exec``, not via a one-off ``run`` invocation.
+#
+# Production deployments:
+# - Override DATABASE_URL to a real Postgres URL
+# - Add a reverse proxy in front (HTTPS, CORS)
+# - Mount /app/data on persistent storage
+
+services:
+  tg-conductor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tg-conductor:latest
+    container_name: tg-conductor
+    restart: unless-stopped
+    tty: true
+    stdin_open: true
+
+    # Bind-mounts (spec §18.3) — every piece of state the host should
+    # own across container rebuilds.
+    volumes:
+      - ./workflows:/app/workflows:ro    # YAML definitions; ro = service
+                                          # cannot mutate, only re-read
+      - ./data:/app/data                 # SQLite + future runtime files
+      - ./pricing.yaml:/app/pricing.yaml:ro
+
+    env_file:
+      - .env
+
+    environment:
+      # Defaults the image already sets — listed here for visibility +
+      # easy override per deployment.
+      BIND_HOST: "0.0.0.0"
+      BIND_PORT: "8765"
+      DATABASE_URL: "sqlite+aiosqlite:///data/tg-conductor.sqlite3"
+      WORKFLOW_DIR: "/app/workflows"
+      DEFAULT_OWNER_ID: "1"
+      # Tune these to your link / Telegram floodwait tolerance:
+      TG_MIN_INTERVAL_SECONDS: "1.0"
+      TG_FLOODWAIT_MAX_RETRIES: "3"
+      JOB_DEFAULT_TIMEOUT_SECONDS: "300"
+      RUN_EVENTS_TTL_DAYS: "30"
+      # CORS — pass a comma-separated list, e.g.
+      # CORS_ORIGINS: "https://dashboard.example.com"
+      CORS_ORIGINS: ""
+
+    ports:
+      - "127.0.0.1:8765:8765"            # bind loopback only by default;
+                                          # let a reverse proxy terminate
+                                          # TLS and expose publicly.

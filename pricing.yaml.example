@@ -1,0 +1,33 @@
+# tg-conductor model pricing table (as of 2026-05).
+#
+# Prices are per 1,000,000 tokens in CNY (人民币元). cost_micros for a
+# single call is computed as:
+#
+#   ceil(prompt_tokens * input_per_1m_yuan)
+#   + ceil(completion_tokens * output_per_1m_yuan)
+#
+# Each micro is 1e-6 yuan, so multiplying tokens (≤ 1M scale) by a yuan
+# price gives micros directly without any unit conversion.
+#
+# OpenAI publishes USD prices; convert at the time of update using
+# ``exchange_rate.usd_to_cny`` if you want to express USD prices here.
+# We bake the converted yuan number into ``*_per_1m_yuan`` directly so
+# the runtime does no multiplication by exchange rate.
+#
+# Models not listed here are accepted at call time but billed at 0 with
+# a WARNING log line (spec ai-usage §"未知模型记 0"). Add an entry as
+# soon as you start using a new model in production.
+#
+# To deploy: ``cp pricing.yaml.example pricing.yaml`` and edit. The
+# runtime reads ``PRICING_FILE`` (env) or ``./pricing.yaml`` by default.
+
+models:
+  gpt-4o-mini:
+    input_per_1m_yuan: 1.05
+    output_per_1m_yuan: 4.20
+  gpt-4o:
+    input_per_1m_yuan: 35.00
+    output_per_1m_yuan: 105.00
+
+exchange_rate:
+  usd_to_cny: 7.20

@@ -1,0 +1,44 @@
+# Keep the build context tight — anything not needed at runtime is excluded.
+
+# Version control / editor metadata
+.git
+.gitignore
+.github
+.cursor
+.vscode
+.idea
+
+# Virtual envs / caches
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+.coverage.*
+htmlcov
+coverage.xml
+
+# Local data — never bake into an image
+data
+logs
+*.sqlite3
+*.sqlite3-*
+*.session
+*.session_string
+.env
+.env.*
+
+# Tests / docs / specs aren't needed in the runtime image
+tests
+docs
+
+# Allow the example pricing file in (Dockerfile copies it explicitly)
+!pricing.yaml.example
+pricing.yaml
+
+# Local Docker overrides
+docker-compose.override.yml

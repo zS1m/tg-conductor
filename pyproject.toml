@@ -1,0 +1,71 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tg-conductor"
+version = "0.1.0"
+description = "Telegram 自动化编排服务：签到、定时发消息、消息监控转发、AI 回复"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "zS1m", email = "mail@contrails.space" }]
+dependencies = [
+    "kurigram",
+    "fastapi",
+    "uvicorn[standard]",
+    "sqlmodel",
+    "greenlet",
+    "alembic",
+    "aiosqlite",
+    "croniter",
+    "pyyaml",
+    "pydantic>=2",
+    "pydantic-settings>=2",
+    "openai",
+    "cryptography",
+    # [socks] pulls in socksio so the OpenAI SDK's httpx client can use a
+    # SOCKS proxy (ALL_PROXY=socks5://... — common with ClashX et al.).
+    "httpx[socks]",
+    "structlog",
+    "click",
+    # Kurigram 的可选 C 加密扩展。缺它时 pyrogram 回退到纯 Python 的 pyaes,
+    # 每次 connect/login 打 "TgCrypto is missing! ... much slower speed" 告警,
+    # 且每个 MTProto 包的 AES-IGE 加解密慢约一个数量级。装上即被自动检测启用。
+    "tgcrypto>=1.2.5",
+]
+
+[project.scripts]
+tg-conductor = "tg_conductor.__main__:cli"
+
+[dependency-groups]
+dev = [
+    "ruff",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "pytest-httpx",
+    "freezegun",
+    "tox",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["tg_conductor"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "W", "C4"]
+ignore = ["E501", "B008", "C901"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--cov=tg_conductor --cov-report=term-missing"
+markers = [
+    "live: integration test hitting real Telegram (skipped unless TG_LIVE_* env vars set)",
+]
