@@ -171,7 +171,7 @@ class Settings(BaseSettings):
 
 _GENERATE_HINT = (
     "Generate one with: "
-    'python -c "import secrets, base64; '
+    'uv run python -c "import secrets, base64; '
     'print(base64.b64encode(secrets.token_bytes(32)).decode())"'
 )
 

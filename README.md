@@ -31,7 +31,7 @@ git clone https://github.com/zS1m/tg-conductor.git && cd tg-conductor
 uv sync
 
 cp .env.example .env
-python -c "import secrets, base64; print(base64.b64encode(secrets.token_bytes(32)).decode())"
+uv run python -c "import secrets, base64; print(base64.b64encode(secrets.token_bytes(32)).decode())"
 #  └─ paste into .env as  APP_MASTER_KEY=<value>   (the only required setting)
 
 uv run tg-conductor migrate
