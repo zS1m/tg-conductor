@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import binascii
 import logging
+from datetime import time
 from functools import cached_property, lru_cache
 from pathlib import Path
 from typing import Annotated, Any
@@ -22,6 +23,14 @@ from pydantic import Field, SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 log = logging.getLogger(__name__)
+
+
+def _parse_hhmm(raw: str) -> time:
+    """Parse a wall-clock ``HH:MM`` string into a :class:`datetime.time`."""
+    parts = raw.strip().split(":")
+    if len(parts) != 2:
+        raise ValueError("expected 'HH:MM'")
+    return time(hour=int(parts[0]), minute=int(parts[1]))
 
 
 def _decode_master_key(raw: str) -> bytes:
@@ -81,6 +90,13 @@ class Settings(BaseSettings):
     # 北京时间. fire_at is always stored in UTC regardless. Validated against
     # the system tz database at load time.
     scheduler_tz: str = "UTC"
+
+    # Wall-clock time (HH:MM, interpreted in ``scheduler_tz``) at which the
+    # daily time_window plan-expansion runs (spec scheduler §"每日 plan 展开").
+    # Default 00:05 — before any typical window start, so the whole day's
+    # window is scheduled ahead of time. Startup additionally runs a one-off
+    # catch-up expansion for the current day.
+    scheduler_expand_at: str = "00:05"
 
     # spec runs §"事件保留与清理": run_events older than ``run_events_ttl_days``
     # are purged by the background cleaner. ``0`` or ``-1`` disables purging
@@ -143,6 +159,17 @@ class Settings(BaseSettings):
             ) from e
         return v
 
+    @field_validator("scheduler_expand_at")
+    @classmethod
+    def _validate_expand_at(cls, v: str) -> str:
+        try:
+            _parse_hhmm(v)
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"scheduler_expand_at must be 'HH:MM' (got {v!r}): {e}"
+            ) from e
+        return v
+
     @field_validator("app_master_key")
     @classmethod
     def _validate_master_key(cls, v: SecretStr) -> SecretStr:
@@ -167,6 +194,11 @@ class Settings(BaseSettings):
     def scheduler_tzinfo(self) -> ZoneInfo:
         """The validated ``scheduler_tz`` as a ``ZoneInfo`` (cron / time_window)."""
         return ZoneInfo(self.scheduler_tz)
+
+    @cached_property
+    def scheduler_expand_time(self) -> time:
+        """``scheduler_expand_at`` parsed to a wall-clock :class:`datetime.time`."""
+        return _parse_hhmm(self.scheduler_expand_at)
 
 
 _GENERATE_HINT = (

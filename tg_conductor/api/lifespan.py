@@ -57,6 +57,7 @@ from tg_conductor.runs.cleanup import EventsTtlCleaner
 from tg_conductor.runs.event_bus import EventBus, InMemoryEventBus
 from tg_conductor.scheduler.account_worker import AccountWorker
 from tg_conductor.scheduler.control import spawn_startup_jobs
+from tg_conductor.scheduler.daily_expander import DailyExpander
 from tg_conductor.scheduler.dispatcher import Dispatcher
 from tg_conductor.scheduler.expander import expand_daily
 from tg_conductor.scheduler.hooks import make_cancel_pending_jobs_hook
@@ -91,6 +92,7 @@ class LifespanState:
     reloader: Reloader
     dispatcher: Dispatcher
     cleaner: EventsTtlCleaner
+    daily_expander: DailyExpander
     workers: dict[int, AccountWorker] = field(default_factory=dict)
     supervised_tasks: list[asyncio.Task[None]] = field(default_factory=list)
 
@@ -290,6 +292,17 @@ async def _startup(settings: Settings) -> LifespanState:
     )
     await cleaner.start()
 
+    # 9b) Daily plan-expander — re-expands time_window Workflows each day at
+    #     ``scheduler_expand_at``. Step 6 only covered the startup day; without
+    #     this every later day stays silent (spec scheduler §"每日 plan 展开").
+    daily_expander = DailyExpander(
+        session_factory=session_factory,
+        owner_id=settings.default_owner_id,
+        expand_at=settings.scheduler_expand_time,
+        tz=settings.scheduler_tzinfo,
+    )
+    await daily_expander.start()
+
     # 10) Final startup summary
     workflows_total = 0
     async with session_factory() as session:
@@ -337,6 +350,7 @@ async def _startup(settings: Settings) -> LifespanState:
         reloader=reloader,
         dispatcher=dispatcher,
         cleaner=cleaner,
+        daily_expander=daily_expander,
         workers=workers,
     )
 
@@ -345,7 +359,8 @@ async def _shutdown(state: LifespanState) -> None:
     """spec §16.2 — drain in flight then tear down outward-in.
 
     Order: dispatcher (so no new jobs queue) → workers (drain in-flight
-    Run) → AccountManager (close TG clients) → cleaner → engine.dispose.
+    Run) → AccountManager (close TG clients) → cleaner → daily_expander →
+    engine.dispose.
     """
     log.info("lifespan.shutdown_begin")
     try:
@@ -368,6 +383,11 @@ async def _shutdown(state: LifespanState) -> None:
         await state.cleaner.stop()
     except Exception:  # noqa: BLE001
         log.exception("lifespan.cleaner_stop_failed")
+
+    try:
+        await state.daily_expander.stop()
+    except Exception:  # noqa: BLE001
+        log.exception("lifespan.daily_expander_stop_failed")
 
     for task in state.supervised_tasks:
         if not task.done():
