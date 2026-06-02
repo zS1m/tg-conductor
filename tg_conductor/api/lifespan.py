@@ -1,9 +1,12 @@
 """Process-level wiring for the ``serve`` command.
 
-spec §16.1 startup order::
+spec §16.1 startup order (ConfigLoader.reload moved *before* AccountManager so
+each account's update mode can be derived from its workflows at connect time —
+account-update-mode change / design D3)::
 
-    configure_logging → DB engine → AccountManager → ConfigLoader.reload
-    → Scheduler tasks (Dispatcher loop, EventsTtlCleaner) → API ready.
+    configure_logging → DB engine → Dispatcher → ConfigLoader.reload
+    → derive update modes → AccountManager → Scheduler tasks
+    (Dispatcher loop, EventsTtlCleaner) → API ready.
 
 spec §16.2 / §16.3 shutdown:
 
@@ -67,6 +70,7 @@ from tg_conductor.tg_core.protocol import TGClient
 from tg_conductor.tg_core.throttle import AccountThrottle
 from tg_conductor.triggers.startup import StartupTracker
 from tg_conductor.workflows import repo as workflow_repo
+from tg_conductor.workflows.update_mode import account_needs_updates
 
 log = get_logger("tg_conductor.lifespan")
 
@@ -94,6 +98,9 @@ class LifespanState:
     cleaner: EventsTtlCleaner
     daily_expander: DailyExpander
     workers: dict[int, AccountWorker] = field(default_factory=dict)
+    # account_id -> needs_updates? — the update mode each live connection was
+    # built with. Baseline for the reload flip-warning; not hot-mutated.
+    account_update_modes: dict[int, bool] = field(default_factory=dict)
     supervised_tasks: list[asyncio.Task[None]] = field(default_factory=list)
 
 
@@ -106,16 +113,22 @@ def _default_client_factory(
     dispatcher: Dispatcher,
     owner_id: int,
     settings: Settings,
+    needs_updates_by_account: dict[int, bool],
 ):
     """Return a ``client_factory`` closure for :class:`AccountManager`.
 
     Each Account becomes a :class:`KurigramAdapter` wired with the same
-    process-wide throttle config; a :class:`MessageRouter` is installed
-    as the ``on_message`` handler so inbound messages from any account
-    dispatch the corresponding ``message_match`` workflows.
+    process-wide throttle config. The account's *update mode* is looked up in
+    ``needs_updates_by_account`` (derived from its workflows before connecting —
+    see :func:`_startup`): **receiving** accounts build with updates enabled and
+    get a :class:`MessageRouter` ``on_message`` handler; **send-only** accounts
+    build with ``receive_updates=False`` (no ``GetChannelDifference`` storm) and
+    register no router. Unknown account ids default to send-only.
     """
 
     def factory(account: Account) -> TGClient:
+        assert account.id is not None
+        needs_updates = needs_updates_by_account.get(account.id, False)
         plaintext_session = account_repo.decrypt_session(account)
         throttle = AccountThrottle(
             min_interval_seconds=settings.tg_min_interval_seconds,
@@ -130,18 +143,91 @@ def _default_client_factory(
             env_proxy=settings.tg_proxy,
             account_label=account.label,
             throttle=throttle,
+            receive_updates=needs_updates,
         )
-        assert account.id is not None
-        router = MessageRouter(
-            session_factory=session_factory,
-            dispatcher=dispatcher,
-            owner_id=owner_id,
+        if needs_updates:
+            router = MessageRouter(
+                session_factory=session_factory,
+                dispatcher=dispatcher,
+                owner_id=owner_id,
+                account_id=account.id,
+            )
+            adapter.on_message(router.on_message)
+        log.info(
+            "lifespan.account_update_mode",
             account_id=account.id,
+            label=account.label,
+            mode="receiving" if needs_updates else "send-only",
         )
-        adapter.on_message(router.on_message)
         return adapter
 
     return factory
+
+
+# ---------------------------------------------------------- update-mode helpers
+
+
+async def _compute_update_modes(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    owner_id: int,
+) -> dict[int, bool]:
+    """Map every non-disabled account → whether it needs Telegram updates.
+
+    Must run *after* workflows are loaded (see :func:`_startup` ordering) so the
+    derivation can see each account's workflows.
+    """
+    modes: dict[int, bool] = {}
+    async with session_factory() as session:
+        accounts = await account_repo.list_for_owner(session, owner_id=owner_id)
+        for acc in accounts:
+            assert acc.id is not None
+            modes[acc.id] = await account_needs_updates(
+                session, owner_id=owner_id, account_id=acc.id
+            )
+    return modes
+
+
+def _make_mode_flip_hook(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    owner_id: int,
+    baseline: dict[int, bool],
+):
+    """Post-reload hook: WARN when an account's derived mode flips vs ``baseline``.
+
+    Update mode is a construct-time parameter — the live connection keeps its
+    original mode until restart. ``baseline`` reflects what each connection was
+    built with and is intentionally *not* mutated, so a still-pending flip keeps
+    warning on every reload until the operator restarts.
+    """
+
+    async def hook() -> None:
+        fresh = await _compute_update_modes(session_factory, owner_id=owner_id)
+        async with session_factory() as session:
+            accounts = {
+                acc.id: acc
+                for acc in await account_repo.list_for_owner(
+                    session, owner_id=owner_id
+                )
+            }
+        for account_id, new_needs in fresh.items():
+            current = baseline.get(account_id, False)
+            if new_needs != current:
+                acc = accounts.get(account_id)
+                log.warning(
+                    "lifespan.update_mode_flip",
+                    account_id=account_id,
+                    label=getattr(acc, "label", None),
+                    from_mode="receiving" if current else "send-only",
+                    to_mode="receiving" if new_needs else "send-only",
+                    hint=(
+                        "update mode is set at connect time; restart required "
+                        "for the new mode to take effect"
+                    ),
+                )
+
+    return hook
 
 
 # ---------------------------------------------------------- supervised tasks
@@ -216,27 +302,11 @@ async def _startup(settings: Settings) -> LifespanState:
         cron_tz=settings.scheduler_tzinfo,
     )
 
-    # 4) AccountManager — builds + connects every non-disabled Account
-    account_manager = AccountManager(
-        session_factory=session_factory,
-        client_factory=_default_client_factory(
-            session_factory=session_factory,
-            dispatcher=dispatcher,
-            owner_id=settings.default_owner_id,
-            settings=settings,
-        ),
-        owner_id=settings.default_owner_id,
-        initial_reconnect_seconds=settings.tg_reconnect_initial_seconds,
-        max_reconnect_seconds=settings.tg_reconnect_max_seconds,
-    )
-    await account_manager.start_all()
-    log.info(
-        "lifespan.accounts_ready",
-        accounts_total=len(account_manager.active_account_ids()),
-    )
-
-    # 5) ConfigLoader / Reloader — pulls yaml workflows in, fires
-    #    cancel_pending_jobs for any that disappeared.
+    # 4) ConfigLoader / Reloader — pulls yaml workflows in *before* accounts
+    #    connect, so the update-mode derivation (step 5) can see each account's
+    #    workflows. validate_workflow only needs the account *row* (created at
+    #    login), not a live connection, so this has no reverse dependency on
+    #    AccountManager (design D3).
     reloader = Reloader(
         session_factory=session_factory,
         workflow_dir=settings.workflow_dir,
@@ -248,7 +318,43 @@ async def _startup(settings: Settings) -> LifespanState:
     else:
         log.warning("lifespan.workflow_dir_missing", path=str(settings.workflow_dir))
 
-    # 6) Startup-trigger spawn + today's time_window catch-up
+    # 5) Derive each account's update mode from its workflows (now in DB).
+    account_update_modes = await _compute_update_modes(
+        session_factory, owner_id=settings.default_owner_id
+    )
+
+    # 6) AccountManager — builds + connects every non-disabled Account; the
+    #    factory builds send-only accounts with updates disabled (no router).
+    account_manager = AccountManager(
+        session_factory=session_factory,
+        client_factory=_default_client_factory(
+            session_factory=session_factory,
+            dispatcher=dispatcher,
+            owner_id=settings.default_owner_id,
+            settings=settings,
+            needs_updates_by_account=account_update_modes,
+        ),
+        owner_id=settings.default_owner_id,
+        initial_reconnect_seconds=settings.tg_reconnect_initial_seconds,
+        max_reconnect_seconds=settings.tg_reconnect_max_seconds,
+    )
+    await account_manager.start_all()
+    log.info(
+        "lifespan.accounts_ready",
+        accounts_total=len(account_manager.active_account_ids()),
+    )
+
+    # Now that connections exist with a known mode, arm the reload flip-warning
+    # (only fires on runtime reloads, not the startup reload above).
+    reloader.on_post_reload(
+        _make_mode_flip_hook(
+            session_factory,
+            owner_id=settings.default_owner_id,
+            baseline=account_update_modes,
+        )
+    )
+
+    # 7) Startup-trigger spawn + today's time_window catch-up
     tracker = StartupTracker()
     async with session_factory() as session, session.begin():
         await spawn_startup_jobs(
@@ -262,7 +368,7 @@ async def _startup(settings: Settings) -> LifespanState:
             tz=tz,
         )
 
-    # 7) AccountWorkers — one per account
+    # 8) AccountWorkers — one per account
     workers: dict[int, AccountWorker] = {}
     for aid in account_manager.active_account_ids():
         client = account_manager.get(aid)
@@ -280,11 +386,11 @@ async def _startup(settings: Settings) -> LifespanState:
         await worker.start()
         workers[aid] = worker
 
-    # 8) Dispatcher loop + SIGHUP-triggered reload
+    # 9) Dispatcher loop + SIGHUP-triggered reload
     await dispatcher.start()
     install_sighup_handler(reloader)
 
-    # 9) Background TTL cleaner for run_events
+    # 10) Background TTL cleaner for run_events
     cleaner = EventsTtlCleaner(
         session_factory=session_factory,
         ttl_days=settings.run_events_ttl_days,
@@ -292,9 +398,9 @@ async def _startup(settings: Settings) -> LifespanState:
     )
     await cleaner.start()
 
-    # 9b) Daily plan-expander — re-expands time_window Workflows each day at
-    #     ``scheduler_expand_at``. Step 6 only covered the startup day; without
-    #     this every later day stays silent (spec scheduler §"每日 plan 展开").
+    # 10b) Daily plan-expander — re-expands time_window Workflows each day at
+    #      ``scheduler_expand_at``. Step 7 only covered the startup day; without
+    #      this every later day stays silent (spec scheduler §"每日 plan 展开").
     daily_expander = DailyExpander(
         session_factory=session_factory,
         owner_id=settings.default_owner_id,
@@ -303,7 +409,7 @@ async def _startup(settings: Settings) -> LifespanState:
     )
     await daily_expander.start()
 
-    # 10) Final startup summary
+    # 11) Final startup summary
     workflows_total = 0
     async with session_factory() as session:
         accounts_total = len(
@@ -352,6 +458,7 @@ async def _startup(settings: Settings) -> LifespanState:
         cleaner=cleaner,
         daily_expander=daily_expander,
         workers=workers,
+        account_update_modes=account_update_modes,
     )
 
 

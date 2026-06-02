@@ -116,6 +116,63 @@ async def test_call_translates_pyrogram_floodwait_to_tg_floodwait() -> None:
     assert excinfo.value.operation == "send_text"
 
 
+def test_default_adapter_builds_client_with_updates_enabled() -> None:
+    """Default (``receive_updates=True``) keeps pyrogram's update behaviour."""
+    adapter = KurigramAdapter(
+        api_id=1,
+        api_hash="x",
+        session_string="some-base64-session",
+        account_label="recv",
+        throttle=_fast_throttle(),
+    )
+    assert adapter.receive_updates is True
+    # ``not True`` → False, behaviourally identical to pyrogram's default.
+    assert adapter._client is not None
+    assert bool(adapter._client.no_updates) is False
+
+
+def test_send_only_adapter_builds_client_with_no_updates() -> None:
+    """``receive_updates=False`` builds the underlying client with no_updates=True."""
+    adapter = KurigramAdapter(
+        api_id=1,
+        api_hash="x",
+        session_string="some-base64-session",
+        account_label="sendonly",
+        throttle=_fast_throttle(),
+        receive_updates=False,
+    )
+    assert adapter.receive_updates is False
+    assert adapter._client is not None
+    assert adapter._client.no_updates is True
+
+
+@pytest.mark.asyncio
+async def test_send_only_adapter_can_still_send_text() -> None:
+    """``no_updates`` must not break outbound calls — send_text still works."""
+    import asyncio
+
+    adapter = KurigramAdapter(
+        api_id=1,
+        api_hash="x",
+        session_string=None,
+        account_label="sendonly",
+        throttle=_fast_throttle(),
+        receive_updates=False,
+    )
+    sent: list[tuple] = []
+
+    class _FakeClient:
+        async def send_message(self, **kwargs):  # type: ignore[no-untyped-def]
+            sent.append((kwargs["chat_id"], kwargs["text"]))
+            return _fake_pyrogram_message(text=kwargs["text"])
+
+    adapter._client = _FakeClient()  # type: ignore[assignment]
+    msg = await adapter.send_text(-100, "ping")
+    assert msg.text == "ping"
+    assert sent == [(-100, "ping")]
+    await asyncio.sleep(0)
+
+
 @pytest.mark.asyncio
 async def test_login_with_session_string_rebuilds_client() -> None:
     adapter = _new_adapter_without_session()

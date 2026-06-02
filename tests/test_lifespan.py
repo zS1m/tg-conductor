@@ -76,7 +76,9 @@ async def _seed_one_account(
 def fake_client_factory(monkeypatch: pytest.MonkeyPatch):
     """Replace ``_default_client_factory`` so AccountManager uses fakes."""
 
-    def make(*, session_factory, dispatcher, owner_id, settings):  # noqa: ARG001
+    def make(  # noqa: ARG001
+        *, session_factory, dispatcher, owner_id, settings, needs_updates_by_account
+    ):
         def factory(account):
             return FakeTGClient(label=account.label)
 
@@ -137,6 +139,186 @@ async def test_full_startup_then_shutdown_round_trip(
     # After shutdown: dispatcher / cleaner tasks done, manager empty.
     assert state.dispatcher._task is None  # noqa: SLF001
     assert state.account_manager.active_account_ids() == []
+
+
+@pytest.mark.asyncio
+async def test_startup_derives_send_only_vs_receiving_modes(
+    settings_in_tmp,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cron-only account → send-only (no router); a message_match account →
+    receiving (router installed). Uses a recording fake so we can assert which
+    accounts got an ``on_message`` handler."""
+    settings = settings_in_tmp
+
+    # A fake that records receive_updates + whether on_message was registered.
+    class _RecordingFake(FakeTGClient):
+        def __init__(self, *, label: str, receive_updates: bool) -> None:
+            super().__init__(label=label)
+            self.receive_updates = receive_updates
+            self.router_installed = False
+
+        def on_message(self, handler) -> None:  # type: ignore[no-untyped-def]
+            self.router_installed = True
+
+    built: dict[str, _RecordingFake] = {}
+
+    def make(  # noqa: ARG001
+        *, session_factory, dispatcher, owner_id, settings, needs_updates_by_account
+    ):
+        def factory(account):
+            needs = needs_updates_by_account.get(account.id, False)
+            client = _RecordingFake(label=account.label, receive_updates=needs)
+            if needs:
+                client.on_message(lambda _m: None)
+            built[account.label] = client
+            return client
+
+        return factory
+
+    monkeypatch.setattr(lifespan_mod, "_default_client_factory", make)
+
+    await asyncio.to_thread(upgrade_head, settings.database_url)
+    engine = create_engine(settings.database_url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as s, s.begin():
+        cron_acc = await account_repo.upsert_session(
+            s, owner_id=1, label="cron", api_id=1, api_hash="h", session_string="s"
+        )
+        recv_acc = await account_repo.upsert_session(
+            s, owner_id=1, label="recv", api_id=1, api_hash="h", session_string="s"
+        )
+        cron_id, recv_id = cron_acc.id, recv_acc.id
+    await engine.dispose()
+
+    (settings.workflow_dir / "cron.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "name": "cron-wf",
+                "account_id": cron_id,
+                "trigger": {"type": "cron", "expression": "* * * * *"},
+                "action_plan": {
+                    "steps": [{"action": "send_text", "chat_id": 1, "text": "x"}]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (settings.workflow_dir / "recv.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "name": "recv-wf",
+                "account_id": recv_id,
+                "trigger": {"type": "message_match", "chat_id": -100123},
+                "action_plan": {
+                    "steps": [{"action": "send_text", "chat_id": 1, "text": "x"}]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = await _startup(settings)
+    try:
+        assert state.account_update_modes == {cron_id: False, recv_id: True}
+        assert built["cron"].receive_updates is False
+        assert built["cron"].router_installed is False
+        assert built["recv"].receive_updates is True
+        assert built["recv"].router_installed is True
+    finally:
+        await _shutdown(state)
+
+
+class _RecordingLog:
+    """Captures structlog-style ``log.<level>(event, **kw)`` calls.
+
+    The lifespan logger is structlog's ``PrintLogger`` (stdout, not stdlib), so
+    ``caplog`` can't see it — we swap the module ``log`` for this recorder.
+    """
+
+    def __init__(self) -> None:
+        self.records: list[tuple[str, str, dict]] = []
+
+    def _mk(self, level: str):
+        def _log(event: str, **kw) -> None:  # type: ignore[no-untyped-def]
+            self.records.append((level, event, kw))
+
+        return _log
+
+    def __getattr__(self, name: str):  # info / warning / error / exception / debug
+        return self._mk(name)
+
+
+@pytest.mark.asyncio
+async def test_reload_flip_to_receiving_warns_and_keeps_mode(
+    settings_in_tmp,
+    tmp_path: Path,
+    fake_client_factory,  # noqa: ARG001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A send-only account that gains its first message_match on reload must
+    WARN (restart required) while its live connection stays send-only."""
+    settings = settings_in_tmp
+
+    await asyncio.to_thread(upgrade_head, settings.database_url)
+    engine = create_engine(settings.database_url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    acc_id = await _seed_one_account(factory)
+    await engine.dispose()
+
+    (settings.workflow_dir / "wf.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "name": "wf",
+                "account_id": acc_id,
+                "trigger": {"type": "cron", "expression": "* * * * *"},
+                "action_plan": {
+                    "steps": [{"action": "send_text", "chat_id": 1, "text": "x"}]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = await _startup(settings)
+    try:
+        # Built send-only.
+        assert state.account_update_modes == {acc_id: False}
+
+        # Swap the logger so we can assert the flip WARNING is emitted.
+        recorder = _RecordingLog()
+        monkeypatch.setattr(lifespan_mod, "log", recorder)
+
+        # Add a message_match workflow and reload at runtime.
+        (settings.workflow_dir / "mm.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "name": "mm",
+                    "account_id": acc_id,
+                    "trigger": {"type": "message_match", "chat_id": -100123},
+                    "action_plan": {
+                        "steps": [{"action": "send_text", "chat_id": 1, "text": "x"}]
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        await state.reloader.reload()
+
+        flips = [
+            kw
+            for level, event, kw in recorder.records
+            if event == "lifespan.update_mode_flip" and level == "warning"
+        ]
+        assert len(flips) == 1
+        assert flips[0]["account_id"] == acc_id
+        assert flips[0]["from_mode"] == "send-only"
+        assert flips[0]["to_mode"] == "receiving"
+        # Baseline (live connection mode) is unchanged — still send-only.
+        assert state.account_update_modes == {acc_id: False}
+    finally:
+        await _shutdown(state)
 
 
 @pytest.mark.asyncio

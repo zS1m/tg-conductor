@@ -72,16 +72,28 @@ class KurigramAdapter:
         account_label: str,
         env_proxy: str | None = None,
         throttle: AccountThrottle | None = None,
+        receive_updates: bool = True,
     ) -> None:
         self.label = account_label
         self._api_id = api_id
         self._api_hash = api_hash
         self._proxy_url = proxy
         self._env_proxy_url = env_proxy
+        # Backend-agnostic "does this connection subscribe to Telegram updates?"
+        # flag (see accounts spec "Account 常驻连接生命周期" / tg-core spec). When
+        # False the underlying Kurigram client is built with ``no_updates=True``
+        # so it never runs ``updates.GetDifference`` / ``GetChannelDifference``;
+        # outbound sends are unaffected.
+        self._receive_updates = receive_updates
         self._client: pyrogram.Client | None = None
         self._throttle = throttle or AccountThrottle()
         if session_string:
             self._build_client(session_string)
+
+    @property
+    def receive_updates(self) -> bool:
+        """Whether this connection subscribes to inbound Telegram updates."""
+        return self._receive_updates
 
     # -- lifecycle ------------------------------------------------------
 
@@ -94,6 +106,12 @@ class KurigramAdapter:
             session_string=session_string,
             in_memory=True,
             proxy=proxy_dict,
+            # send-only accounts: ``no_updates=True`` wraps every request in
+            # InvokeWithoutUpdates and starts no dispatcher workers, so the
+            # server stops pushing updates and the runtime GetChannelDifference
+            # path never fires. ``False`` is behaviourally identical to
+            # pyrogram's default (updates enabled) — keeps default unchanged.
+            no_updates=not self._receive_updates,
         )
 
     async def connect(self) -> None:

@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -67,6 +67,17 @@ class Reloader:
         self._lock = asyncio.Lock()
         self._running: asyncio.Task[ReloadResult] | None = None
         self._pending: asyncio.Task[ReloadResult] | None = None
+        self._post_reload: Callable[[], Awaitable[None]] | None = None
+
+    def on_post_reload(self, callback: Callable[[], Awaitable[None]] | None) -> None:
+        """Register a hook run after every successful reload (best-effort).
+
+        Used by the lifespan to compare each account's freshly-derived update
+        mode against the mode its live connection was built with, and WARN on a
+        flip (update mode is a construct-time parameter; a restart is required).
+        Set *after* the startup reload so it only fires on runtime reloads.
+        """
+        self._post_reload = callback
 
     async def reload(self) -> ReloadResult:
         async with self._lock:
@@ -154,6 +165,11 @@ class Reloader:
                 len(sync_report.updated),
                 len(sync_report.deleted),
             )
+        if self._post_reload is not None:
+            try:
+                await self._post_reload()
+            except Exception:  # noqa: BLE001 - a hook failure must not fail reload
+                log.exception("config_loader.post_reload_hook_failed")
         return ReloadResult(sync=sync_report, parse_errors=all_parse_errors)
 
 
