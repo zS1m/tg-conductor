@@ -1,20 +1,22 @@
 """spec scheduler §"每日 plan 展开" — the daily re-expansion background task.
 
-Regression for the "works day 1, silent day 2" bug: time_window Workflows
-were only ever expanded for the day the process started, because the daily
-expansion loop the spec mandates was never wired up. These tests pin:
+Regression for the "works day 1, silent day 2" bug. The first fix added a
+daily loop but slept on one multi-hour timer, which in production never
+woke — every day after startup stayed silent. The loop now *polls* on a
+short interval (like the dispatcher, which never had the problem). These
+tests pin:
 
-* :func:`_next_run_at` picks the correct wall-clock day boundary.
 * :meth:`DailyExpander.expand_for` produces Jobs for *each* day it's asked
   about (the missing multi-day capability).
-* The running loop actually invokes an expansion at the scheduled instant.
+* The polling loop expands a day once it passes ``expand_at`` and — the
+  decisive case the old single-timer design failed — expands the *next*
+  day too, with the same long-lived task, after the wall clock rolls over.
 """
 
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, date, datetime, time, timedelta
-from zoneinfo import ZoneInfo
+from datetime import UTC, date, datetime, time
 
 import pytest
 from freezegun import freeze_time
@@ -25,7 +27,7 @@ from tg_conductor.db.engine import create_engine
 from tg_conductor.db.migrate import upgrade_head
 from tg_conductor.scheduler import daily_expander as de
 from tg_conductor.scheduler import repo as job_repo
-from tg_conductor.scheduler.daily_expander import DailyExpander, _next_run_at
+from tg_conductor.scheduler.daily_expander import DailyExpander
 from tg_conductor.workflows import repo as workflow_repo
 from tg_conductor.workflows.models import WorkflowSource
 from tg_conductor.workflows.schema import Workflow
@@ -78,34 +80,6 @@ async def session_factory(
         await engine.dispose()
 
 
-# --------------------------------------------------------------- _next_run_at
-
-
-def test_next_run_at_before_expand_time_picks_today() -> None:
-    tz = UTC
-    now = datetime(2026, 6, 1, 0, 0, tzinfo=tz)  # before 00:05
-    assert _next_run_at(now, time(0, 5), tz) == datetime(2026, 6, 1, 0, 5, tzinfo=tz)
-
-
-def test_next_run_at_at_or_after_expand_time_picks_tomorrow() -> None:
-    tz = UTC
-    now = datetime(2026, 6, 1, 0, 5, tzinfo=tz)  # exactly at → strictly after
-    assert _next_run_at(now, time(0, 5), tz) == datetime(2026, 6, 2, 0, 5, tzinfo=tz)
-
-    later = datetime(2026, 6, 1, 18, 0, tzinfo=tz)
-    assert _next_run_at(later, time(0, 5), tz) == datetime(2026, 6, 2, 0, 5, tzinfo=tz)
-
-
-def test_next_run_at_uses_wall_clock_in_tz() -> None:
-    tz = ZoneInfo("Asia/Shanghai")
-    # 16:00 UTC == 00:00 CST next-ish; pick a time so "now" (CST) is before 00:05.
-    now = datetime(2026, 6, 1, 0, 0, tzinfo=tz)
-    nxt = _next_run_at(now, time(0, 5), tz)
-    assert nxt == datetime(2026, 6, 1, 0, 5, tzinfo=tz)
-    # The instant is 00:05 Shanghai, i.e. 16:05 UTC the previous day.
-    assert nxt.astimezone(UTC) == datetime(2026, 5, 31, 16, 5, tzinfo=UTC)
-
-
 # --------------------------------------------------------------- expand_for
 
 
@@ -152,48 +126,90 @@ async def test_expand_for_is_idempotent(
     assert second.created_job_ids == []  # same day → no duplicates
 
 
-# --------------------------------------------------------------- running loop
+# --------------------------------------------------------------- polling loop
+
+
+async def _wait_until(predicate, timeout: float = 2.0) -> None:
+    """Poll ``predicate`` in real time until true (loop uses real asyncio sleep)."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("condition not met within timeout")
 
 
 @pytest.mark.asyncio
-async def test_loop_invokes_expansion_at_scheduled_instant(
+async def test_loop_waits_until_expand_at_then_expands(
     session_factory: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The loop must actually wake and expand — not just compute a schedule.
+    """Before ``expand_at`` the loop must NOT expand; once past it, it must.
 
-    We collapse the wait to ~50ms via a patched ``_next_run_at`` and record
-    the date the loop asks to expand.
+    ``_now`` is the injected clock seam — we hold it before 00:05, confirm
+    nothing fires, then move it past and confirm the expansion runs.
     """
     expander = DailyExpander(
         session_factory=session_factory,
         owner_id=1,
         expand_at=time(0, 5),
         tz=UTC,
+        poll_seconds=0.01,
     )
-
-    called = asyncio.Event()
+    clock = {"now": datetime(2026, 6, 2, 0, 4, tzinfo=UTC)}  # before 00:05
     seen: list[date] = []
-    fire = datetime.now(UTC) + timedelta(seconds=0.05)
-
-    def fake_next(now: datetime, expand_at: time, tz: object) -> datetime:
-        # Collapse the wait to ~50ms; .date() is what the loop expands for.
-        return fire
 
     async def recorder(d: date) -> object:
         seen.append(d)
-        called.set()
-        # Sleep a touch so the loop doesn't busy-respin before we stop it.
-        await asyncio.sleep(0.5)
         return de.ExpansionReport()
 
-    monkeypatch.setattr(de, "_next_run_at", fake_next)
+    monkeypatch.setattr(expander, "_now", lambda: clock["now"])
     monkeypatch.setattr(expander, "expand_for", recorder)
 
     await expander.start()
     try:
-        await asyncio.wait_for(called.wait(), timeout=2.0)
+        await asyncio.sleep(0.1)  # several poll ticks while still before 00:05
+        assert seen == []  # not yet
+        clock["now"] = datetime(2026, 6, 2, 0, 6, tzinfo=UTC)  # past 00:05
+        await _wait_until(lambda: seen == [date(2026, 6, 2)])
     finally:
         await expander.stop()
 
-    assert seen == [fire.date()]
+
+@pytest.mark.asyncio
+async def test_loop_expands_each_day_across_rollover(
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The decisive regression: ONE long-lived task expands day N+1 too.
+
+    The old single-long-timer design woke once (or never) and went silent.
+    The polling loop must keep firing across midnight: day 2, then day 3,
+    each exactly once, from the same task.
+    """
+    expander = DailyExpander(
+        session_factory=session_factory,
+        owner_id=1,
+        expand_at=time(0, 5),
+        tz=UTC,
+        poll_seconds=0.01,
+    )
+    clock = {"now": datetime(2026, 6, 2, 0, 6, tzinfo=UTC)}
+    seen: list[date] = []
+
+    async def recorder(d: date) -> object:
+        seen.append(d)
+        return de.ExpansionReport()
+
+    monkeypatch.setattr(expander, "_now", lambda: clock["now"])
+    monkeypatch.setattr(expander, "expand_for", recorder)
+
+    await expander.start()
+    try:
+        await _wait_until(lambda: seen == [date(2026, 6, 2)])
+        clock["now"] = datetime(2026, 6, 3, 0, 6, tzinfo=UTC)  # roll over
+        await _wait_until(lambda: seen == [date(2026, 6, 2), date(2026, 6, 3)])
+        await asyncio.sleep(0.05)  # let more ticks pass — no duplicates
+        assert seen == [date(2026, 6, 2), date(2026, 6, 3)]
+    finally:
+        await expander.stop()
